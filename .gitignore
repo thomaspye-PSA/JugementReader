@@ -1,0 +1,7 @@
+
+*__pycache__*/
+*.pyc
+
+# Database files
+repo/
+repo*/

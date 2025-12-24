@@ -3,7 +3,7 @@ import re
 import json
 import time
 from dataclasses import dataclass
-from typing import Iterator, Optional, Dict, Any, List, Tuple
+from typing import Iterator, Optional, Dict, Any, List
 from urllib.parse import urlencode, urlparse
 
 import requests
@@ -14,7 +14,10 @@ BASE = "https://caselaw.nationalarchives.gov.uk"
 ATOM_URL = f"{BASE}/atom.xml"
 
 # --- Simple configuration ---
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.10240"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.10240"
+)
 REQUEST_TIMEOUT = 30
 SLEEP_BETWEEN_REQUESTS = 0.3  # keep well under rate limits (1000 req / 5 min)
 
@@ -34,6 +37,7 @@ NS_AKN = {
     "uk": UK_NS,
     "html": HTML_NS,
 }
+
 
 @dataclass
 class AtomEntry:
@@ -57,21 +61,23 @@ def _safe_slug(s: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "", s)
     return s[:180]
 
+
 def _clean_text(s: str) -> str:
     if not s:
         return ""
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+
 def _ensure_absolute_url(href: str) -> str:
     if not href:
         return href
     if href.startswith("http://") or href.startswith("https://"):
         return href
-    # TNA sometimes returns relative links like "/uksc/2025/41/data.xml"
     if href.startswith("/"):
         return BASE + href
     return BASE + "/" + href
+
 
 def _document_uri_from_xml_link(xml_link: str) -> Optional[str]:
     """
@@ -82,10 +88,22 @@ def _document_uri_from_xml_link(xml_link: str) -> Optional[str]:
         return None
     parsed = urlparse(xml_link)
     path = parsed.path.strip("/")
-    # Typically ends with /data.xml
     if path.endswith("data.xml"):
         path = path[: -len("data.xml")].rstrip("/")
     return path or None
+
+
+def validate_court_slug(session: requests.Session, court: str) -> bool:
+    """
+    Quickly validate whether a 'court' slug is accepted by the Atom endpoint.
+    We request page=1 and see whether we get a 200 and a well-formed feed.
+    """
+    try:
+        feed = fetch_atom_page(session, page=1, per_page=1, court=court, order="-date")
+        # must have a root <feed> in Atom namespace
+        return feed.tag.endswith("feed")
+    except Exception:
+        return False
 
 
 # ----------------------------
@@ -105,6 +123,7 @@ def fetch_atom_page(
     resp.raise_for_status()
     return etree.fromstring(resp.content)
 
+
 def parse_atom_entries(feed_xml: etree._Element) -> List[AtomEntry]:
     entries: List[AtomEntry] = []
 
@@ -115,11 +134,9 @@ def parse_atom_entries(feed_xml: etree._Element) -> List[AtomEntry]:
         if published:
             published = published.strip()
 
-        # Correct namespace-aware extraction for tna:uri
         uri = (e.findtext("tna:uri", namespaces=NS_ATOM) or "").strip()
-
-        # Fallback: try local-name based search if namespace ever changes
         if not uri:
+            # fallback if namespace changes
             uri = (e.xpath("string(.//*[local-name()='uri'][1])") or "").strip()
 
         if not uri:
@@ -162,6 +179,7 @@ def parse_atom_entries(feed_xml: etree._Element) -> List[AtomEntry]:
 
     return entries
 
+
 def find_next_page(feed_xml: etree._Element) -> Optional[int]:
     for link in feed_xml.findall("atom:link", namespaces=NS_ATOM):
         if link.get("rel") == "next":
@@ -171,15 +189,17 @@ def find_next_page(feed_xml: etree._Element) -> Optional[int]:
                 return int(m.group(1))
     return None
 
-def iter_uksc_entries(
+
+def iter_court_entries(
     session: requests.Session,
+    court: str,
     start_page: int = 1,
     per_page: int = 50,
     order: str = "-date",
 ) -> Iterator[AtomEntry]:
     page = start_page
     while True:
-        feed = fetch_atom_page(session, page=page, per_page=per_page, court="uksc", order=order)
+        feed = fetch_atom_page(session, page=page, per_page=per_page, court=court, order=order)
         entries = parse_atom_entries(feed)
         for entry in entries:
             yield entry
@@ -201,7 +221,6 @@ def fetch_document_xml(session: requests.Session, entry: AtomEntry) -> bytes:
     if entry.xml_link:
         url = entry.xml_link
     else:
-        # Fall back to BASE/{uri}/data.xml
         url = f"{BASE}/{entry.uri}/data.xml"
 
     resp = session.get(url, timeout=REQUEST_TIMEOUT)
@@ -246,8 +265,8 @@ def parse_akn_judgment(xml_bytes: bytes) -> Dict[str, Any]:
     for p in root.xpath(".//akn:header//akn:party", namespaces=NS_AKN):
         parties.append({
             "name": _clean_text(" ".join(p.xpath(".//text()"))),
-            "role_ref": p.get("as"),            # e.g. "#appellant"
-            "person_ref": p.get("refersTo"),    # e.g. "#simkova"
+            "role_ref": p.get("as"),
+            "person_ref": p.get("refersTo"),
         })
 
     # ---- Judges ----
@@ -258,37 +277,36 @@ def parse_akn_judgment(xml_bytes: bytes) -> Dict[str, Any]:
             "ref": j.get("refersTo"),
         })
 
-    # ---- Full text (for retrieval baseline / fallback) ----
+    # ---- Full text (baseline) ----
     full_text = _clean_text(" ".join(root.xpath(".//text()")))
 
-    # ---- Paragraphs with official structure ----
+    # ---- Paragraphs ----
     paragraphs: List[Dict[str, Any]] = []
     para_ref_links: List[Dict[str, Any]] = []
 
+    # We use local-name to be robust across slightly different AKN serialisations,
+    # but still keep namespaces for ref parsing.
     for para in root.xpath(".//akn:judgmentBody//*[local-name()='paragraph'][@eId]", namespaces=NS_AKN):
-
         eId = para.get("eId")
-        num = _clean_text("".join(para.xpath("./akn:num//text()", namespaces=NS_AKN)))
-        text = _clean_text(" ".join(para.xpath("./akn:content//text()", namespaces=NS_AKN)))
-        # only keep main judgment paragraphs (skip footnote paragraphs etc)
         if not eId or not eId.startswith("para_"):
             continue
 
-        # paragraph number: direct child <num>
+        # Direct number (avoid nested embeddedStructure numbers)
         num = _clean_text("".join(para.xpath("./akn:num[1]//text()", namespaces=NS_AKN)))
 
-        # take the first direct content node (best signal)
-        content = para.xpath("./akn:content[1]", namespaces=NS_AKN)
-        if content:
-            text = _clean_text(" ".join(content[0].xpath(".//text()")))
+        # Take direct content only (avoid embeddedStructure footnote paragraphs)
+        content_nodes = para.xpath("./akn:content[1]", namespaces=NS_AKN)
+        if content_nodes:
+            content_node = content_nodes[0]
+            text = _clean_text(" ".join(content_node.xpath(".//text()")))
         else:
-            # fallback: everything under para
+            # fallback if structure is odd
             text = _clean_text(" ".join(para.xpath(".//text()")))
 
         if not text:
             continue
 
-        # References within this paragraph
+        # --- References within this paragraph (exclude nested embeddedStructure refs if desired) ---
         case_refs = []
         leg_refs = []
 
@@ -324,7 +342,7 @@ def parse_akn_judgment(xml_bytes: bytes) -> Dict[str, Any]:
                 "legislation_refs": leg_refs,
             })
 
-    # ---- Global references (deduped across document) ----
+    # ---- Global references (deduped) ----
     all_refs = []
     for r in root.xpath(".//akn:ref[@uk:type]", namespaces=NS_AKN):
         all_refs.append({
@@ -379,6 +397,7 @@ def write_case_files(
     entry: AtomEntry,
     xml_bytes: bytes,
     parsed: Dict[str, Any],
+    court: str,
 ) -> str:
     """
     Writes:
@@ -388,9 +407,10 @@ def write_case_files(
       - paragraphs.jsonl
       - references.json
 
-    Returns output directory.
+    Output directory:
+      base_dir/<court>/<uri_slug>/
     """
-    out_dir = os.path.join(base_dir, "uksc", _safe_slug(entry.uri))
+    out_dir = os.path.join(base_dir, _safe_slug(court), _safe_slug(entry.uri))
     os.makedirs(out_dir, exist_ok=True)
 
     xml_path = os.path.join(out_dir, "data.xml")
@@ -403,9 +423,8 @@ def write_case_files(
         f.write(xml_bytes)
 
     with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(parsed["full_text"] or "")
+        f.write(parsed.get("full_text") or "")
 
-    # --- meta.json (document-level + Atom metadata) ---
     meta = {
         "document_uri": entry.uri,
         "atom_title": entry.title,
@@ -418,19 +437,16 @@ def write_case_files(
             "html": entry.html_link,
             "data_xml": entry.xml_link or f"{BASE}/{entry.uri}/data.xml",
         },
-        "akn": parsed["meta"],   # structured AKN metadata
+        "akn": parsed["meta"],
     }
 
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # --- paragraphs.jsonl ---
-    # One paragraph per line: ideal for indexing pipelines.
     with open(paras_path, "w", encoding="utf-8") as f:
         for p in parsed["paragraphs"]:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
 
-    # --- references.json (document-level references + per-paragraph links) ---
     refs_obj = {
         "references": parsed["references"],
         "paragraph_reference_links": parsed["paragraph_reference_links"],
@@ -441,16 +457,15 @@ def write_case_files(
     return out_dir
 
 
-def already_downloaded(base_dir: str, document_uri: str, content_hash: Optional[str]) -> bool:
+def already_downloaded(base_dir: str, court: str, document_uri: str, content_hash: Optional[str]) -> bool:
     """
     Skip if we already have this document and, if present, the content hash matches.
     """
-    out_dir = os.path.join(base_dir, "uksc", _safe_slug(document_uri))
+    out_dir = os.path.join(base_dir, _safe_slug(court), _safe_slug(document_uri))
     meta_path = os.path.join(out_dir, "meta.json")
     if not os.path.exists(meta_path):
         return False
 
-    # If no hash, assume ok
     if not content_hash:
         return True
 
@@ -466,32 +481,47 @@ def already_downloaded(base_dir: str, document_uri: str, content_hash: Optional[
 # Main pipeline
 # ----------------------------
 
-def build_uksc_repo(base_dir: str, max_docs: Optional[int] = None, start_page: int = 1):
+def build_court_repo(
+    base_dir: str,
+    court: str,
+    max_docs: Optional[int] = None,
+    start_page: int = 1,
+    per_page: int = 50,
+    order: str = "-date",
+):
     """
-    Main pipeline:
-    - Iterate through UKSC atom feed
+    Generic pipeline for any valid TNA court slug:
+    - Iterate Atom feed for <court>
     - Download data.xml for each doc
-    - Parse LegalDocML properly (Akoma Ntoso namespaces)
-    - Save raw + structured outputs
+    - Parse Akoma Ntoso
+    - Save raw + structured outputs under base_dir/<court>/
     """
     os.makedirs(base_dir, exist_ok=True)
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
+    if not validate_court_slug(session, court):
+        raise ValueError(
+            f"Invalid or unsupported court slug for Atom feed: '{court}'. "
+            f"Try opening {ATOM_URL}?court=<slug>&page=1&per_page=1"
+        )
+
     count = 0
-    for entry in tqdm(iter_uksc_entries(session, start_page=start_page), desc="UKSC judgments"):
+    desc = f"{court} judgments"
+    for entry in tqdm(iter_court_entries(session, court=court, start_page=start_page, per_page=per_page, order=order), desc=desc):
         if max_docs is not None and count >= max_docs:
             break
 
-        if already_downloaded(base_dir, entry.uri, entry.content_hash):
-            print(f"[SKIP] {entry.uri} (already downloaded with same content hash)")
+        if already_downloaded(base_dir, court, entry.uri, entry.content_hash):
+            # optional: comment out if too noisy
+            # print(f"[SKIP] {entry.uri} (already downloaded with same content hash)")
             continue
 
         try:
             xml_bytes = fetch_document_xml(session, entry)
             parsed = parse_akn_judgment(xml_bytes)
-            write_case_files(base_dir, entry, xml_bytes, parsed)
+            write_case_files(base_dir, entry, xml_bytes, parsed, court=court)
 
             count += 1
             time.sleep(SLEEP_BETWEEN_REQUESTS)
@@ -506,9 +536,11 @@ def build_uksc_repo(base_dir: str, max_docs: Optional[int] = None, start_page: i
             print(f"[ERROR] {entry.uri}: {e}")
             time.sleep(2)
 
-    print(f"Done. Downloaded/updated {count} documents.")
+    print(f"Done. Downloaded/updated {count} documents for court={court}.")
 
 
 if __name__ == "__main__":
-    # Example: build a repo in ./repo with first 25 docs (good for testing)
-    build_uksc_repo(base_dir="./repo", max_docs=float("inf"), start_page=1)
+
+    courts = ["uksc", "ukut/lc", ]
+    for court in courts:
+        build_court_repo(base_dir="./repo2", court=court, max_docs=50, start_page=1)

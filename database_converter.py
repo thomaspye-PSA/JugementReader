@@ -117,7 +117,7 @@ def _parse_akn_header_fields(xml_path: str) -> Dict[str, Any]:
 
 def repo_to_dataframes(
     base_dir: str,
-    court: str = "uksc",
+    court: Optional[str] = None,
     include_paragraphs: bool = False,
     max_cases: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
@@ -134,19 +134,35 @@ def repo_to_dataframes(
       paragraphs_df: optional one row per paragraph (if include_paragraphs=True)
     """
 
-    court_dir = os.path.join(base_dir, court.lower())
-    if not os.path.exists(court_dir):
-        raise FileNotFoundError(f"Could not find court directory: {court_dir}")
+    if court:
+        court_dir = os.path.join(base_dir, court.lower())
+        if not os.path.exists(court_dir):
+            raise FileNotFoundError(f"Could not find court directory: {court_dir}")
 
-    case_rows: List[Dict[str, Any]] = []
-    para_rows: List[Dict[str, Any]] = []
+        case_rows: List[Dict[str, Any]] = []
+        para_rows: List[Dict[str, Any]] = []
 
-    subdirs = [os.path.join(court_dir, d) for d in os.listdir(court_dir)]
-    subdirs = [d for d in subdirs if os.path.isdir(d)]
-    subdirs.sort()
+        subdirs = [os.path.join(court_dir, d) for d in os.listdir(court_dir)]
+        subdirs = [d for d in subdirs if os.path.isdir(d)]
+        subdirs.sort()
+    else:
+        # Scan all court subdirectories
+        subdirs = []
+        for court_name in os.listdir(base_dir):
+            court_dir = os.path.join(base_dir, court_name)
+            if not os.path.isdir(court_dir):
+                continue
+            court_subdirs = [os.path.join(court_dir, d) for d in os.listdir(court_dir)]
+            court_subdirs = [d for d in court_subdirs if os.path.isdir(d)]
+            court_subdirs.sort()
+            subdirs.extend(court_subdirs)
+
 
     if max_cases is not None:
         subdirs = subdirs[:max_cases]
+
+    case_rows: List[Dict[str, Any]] = []
+    para_rows: List[Dict[str, Any]] = []
 
     for case_path in subdirs:
         meta_path = os.path.join(case_path, "meta.json")
@@ -249,8 +265,8 @@ def repo_to_dataframes(
 if __name__ == "__main__":
 
     cases_df, paragraphs_df = repo_to_dataframes(
-        base_dir=r".\repo",
-        court="uksc",
+        base_dir=r".\repo2",
+        # court="uksc",
         include_paragraphs=True
     )
 
